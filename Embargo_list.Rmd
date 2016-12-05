@@ -1,0 +1,328 @@
+---
+title: "Embargo-List"
+author: "Tim Kettenacker"
+date: "4 Juli 2016"
+output: html_document
+---
+
+### Outline
+
+An embargo list contains persons and organizations that are involved in criminal activities. Companies are obliged by law and compliance regulatories to exclude them from any trade activities. Thus, they need to compare their customer data to sanction lists.
+
+Once loaded into a central repository like CDH, a company is able to determine matches between their data and blacklisted persons/organizations.  
+
+
+### Analysis
+
+The embargo list is provided as XML. Its internal structure is a bit offbeat to handle. It needs to be parsed and logically decomposed to make it available in a useable format for CDH. 
+
+```{r, warning=FALSE, message=FALSE}
+library(XML)
+raw <- readLines("Ges0605.xml")
+xml <- xmlTreeParse(raw, useInternal = T)
+summary(xml)
+```
+
+A short analysis of the raw input file suggests that the relevant information is stored in  somewhat crocked ways in the "entity"-node (same number as "headerEntry"). This node contains associated terrorist organizations and their alias names (nested in the "entryName"-subnode) and occasionally one or more "addressEntry" (a region where they are supposed to stay). Hence, every "entity"-node - or terrorist group - houses several aliases or persons ("nameEntry").
+
+    <entity mainId="0011872020150815" datAkt="2015-08-15" status="i">
+      <headerEntry validFrom="2015-08-15" validTo="4000-01-01" entryDate="2015-08-15" sourceType="TAL" entityType="E" datAkt="2015-08-15" status="i">
+        <source>EG-VO Nr.1390/2015-A01</source>
+        <comm>Weitere Angaben: 2013 von ausl?ndischen terroristischen K?mpfern gegr?ndet. Standort: Arabische Republik Syrien. Der Organisation ISIL (Islamic State in Iraq and the Levant) ...</comm>
+        <commEn>Other information: Established by foreign terrorist fighters in 2013. Location: Syrian Arab Republic. Affiliated with Islamic State in Iraq and the Levant, listed as Al-Qaida in Ir</commEn>
+      </headerEntry>
+      <nameEntry nameId="00926660" datAkt="2015-08-15" status="i">
+        <name>Armata emigran.ilor .i sus.inatorilor</name>
+        <nationality/>
+        <passNo/>
+        <identNo/>
+      </nameEntry>
+      <nameEntry nameId="00926670" datAkt="2015-08-15" status="i">
+        <.../>
+      </nameEntry>
+      <addressEntry addressId="00147750" datAkt="2015-08-15" status="i">
+        <street>Region Dschabal Turkman</street>
+        <houseNo/>
+        <nameCo/>
+        <building/>
+        <roomNo/>
+        <poCode/>
+        <poBox/>
+        <city>Gouvernement Latakia</city>
+        <dist/>
+        <state/>
+        <country>SY</country>
+      </addressEntry>
+    </entity> 
+
+
+### Solution Architecture
+
+It makes perfectly sense to store all of the persons/organizations nested in the "nameEntry"-node as separate entities in CDH as they will be matched together by Uniservs matching components. Since name and address fields are either short strings or not filled at all, one will have a hard time to tweak and twirl the classical matching configuration to find a sufficient matching outcome. Therefore, I suggest to copy the mainId of the "entity"-node belonging to each "nameEntry"-child node and put it in a separate field of the person/organization entity-to-be. Afterwards, extend the classical matching to match across these fields with a 1:1 string comparison. Therefore, all of the relationships remain intact.
+
+At the time being, I prefer to unnest the xml file, store each person/organization as a row in a data frame (an internal R object) and output it as csv. It's way more comfortable to edit a person/organization column in csv than xml. 
+
+Not all the information from the input file will eventually be stored in the hub. Some is omitted in the first step for logical reasons, e.g. a description of the terror group on the "entity"-node fits nowhere if the mainId is stored as a groupId to each person/organization (one consideration for a later point in time is to store this information as another entity containing the commentary and valid to/from-fields, the groupId would then serve as a foreign key to this entity). Others need to be stored redundantly, most notably the address, if present. 
+
+The structure of a record in the CDH is going to contain:
+
+        Name                                Address
+        ====                                =======
+        record.Id (mock-up)                 address.type (mock-up) 
+        record.source (mock-up)             street
+        record.type (mock-up)               houseNo
+        name                                nameCo
+        nationality                         roomNo
+        passNo                              postalcode (poCode)
+        identNo                             postbox (pBox)
+        groupId                             city
+                                            district (dist)
+                                            state
+                                            country
+
+So let's have a look at how to extract these parts using the [Xpath-language!](https://www.w3.org/TR/xpath/)
+
+```{r, message=FALSE, warning=FALSE}
+records <- xpathSApply(xml, "//entity")
+# display content of random record
+records[[1904]]
+```
+
+The record above (and all other records, of course) consists of several single nodes. One can access these nodes programmatically to retrieve relevant information and store it in a dataframe. First of all, we need to subset the nodes. The child node "nameEntry" contains the fields name, nationality, passNo and identNo. They can be fetched in one go. 
+
+```{r, message=FALSE, warning=FALSE}
+NEnodes = xpathSApply(records[[1904]], ".//nameEntry")
+NEnodes
+```
+
+Next, let's retrieve the Id of the whole cluster which I will later call groupId and kind of add to the name elements. 
+
+```{r, message=FALSE, warning=FALSE}
+groupId <- xmlAttrs(records[[1904]])
+groupId
+groupId[[1]]
+
+```
+
+So much for the name elements. The same function used to fetch the child nodes of "nameEntry" can be used to retrieve the address elements.
+
+```{r, message=FALSE, warning=FALSE}
+AEnodes = xpathSApply(records[[1904]], ".//addressEntry")
+AEnodes
+```
+
+This outcome also yields the explanation for creating a mock-up id for each record instead of copying the name id. If we were to extract the name id, we would need to append it to three addresses in a later point in time (in this example); we would link all five person/organization to each of them. According to the cartesian product, this results in 15 records and 10 times, we would use the same id. When loading same ids into the hub, it thinks we want to update the records, thus resulting in only 5 records in total and a hugh information loss. For now, we omit this step for complexity reasons: in case a terrorist organization has more than 1 known address, we simply take the first one and ignore the others. 
+
+All of the previous knowledge is combined in the script that ultimately transforms the xml input to one giant data frame:
+
+```{r, message=FALSE, warning=FALSE, eval=FALSE}
+#create empty default address data.frame for records without address data 
+street <- NA                               
+houseNo <- NA                                 
+nameCo <- NA
+building <- NA
+roomNo <- NA
+poCode <- NA
+poBox <- NA
+city <- NA
+dist <- NA
+state <- NA
+country <- NA
+
+addr_default.df <- data.frame(street, houseNo, nameCo, building, roomNo, poCode, poBox, city, dist, state, country)
+
+# initialize data frame
+groupId <- xmlAttrs(records[[1]])
+groupId <- groupId[[1]]
+NEnodes = xpathSApply(records[[1]], ".//nameEntry")
+names.df <- xmlToDataFrame(NEnodes)
+AEnodes = xpathSApply(records[[1]], ".//addressEntry")
+m <- length(AEnodes)
+# glue address.df to names.df depending on the amount of address elements
+      if(m == 1){
+         address.df <- xmlToDataFrame(AEnodes)
+      }
+      if(m > 1){
+        address.df <- xmlToDataFrame(AEnodes)
+        address.df <- address.df[1,]
+      }
+      if(m == 0){
+        address.df <- addr_default.df
+      }
+tdf <- cbind(names.df, groupId)
+tdf <- cbind(tdf, address.df)
+df <- tdf
+
+# process the rest of the data
+for(i in 2:1984){
+  groupId <- xmlAttrs(records[[i]])
+  groupId <- groupId[[1]]
+  NEnodes = xpathSApply(records[[i]], ".//nameEntry")
+  names.df <- xmlToDataFrame(NEnodes)
+  AEnodes = xpathSApply(records[[i]], ".//addressEntry")
+  m <- length(AEnodes)
+      if(m == 1){
+         address.df <- xmlToDataFrame(AEnodes)
+      }
+      if(m > 1){
+        address.df <- xmlToDataFrame(AEnodes)
+        address.df <- address.df[1,]
+      }
+      if(m == 0){
+        address.df <- addr_default.df
+      }
+  tdf <- cbind(names.df, groupId)
+  tdf <- cbind(tdf, address.df)
+  df <- rbind(df, tdf)
+}
+```
+
+Eventually all data is stored in a large data frame. What is still needed are the mock-up data fields for record.source, record.type and address.type. Their content can be created on the fly. The last step is writing the input of the data frame to csv. As soon as the file is created, one has to update the name of the very first column with "record.id". The record ids are created automatically by the function that writes to csv.
+
+```{r, message=FALSE, warning=FALSE, eval=FALSE}
+df$record.source <- "embargo"
+df$record.type <- "person"
+df$address.type <- "default"
+out_file <- paste(tempdir(), "/embargolist.csv", sep="")
+write.csv2(df, out_file, fileEncoding = "UTF-8")
+```
+
+Here you go!
+
+
+===========================================================================
+
+<!-- <strong>UPDATE on 20th August 2016</strong>  -->
+
+<!-- In the light of new information, several points needed some rework.  -->
+
+<!-- Since the name of the terrorist organization is actually not part of the "entity main"-fragment (where you would expect it), the decision has been made to take the first name of the name entry and treat it as the name of the head terrorist organization. Furthermore, the addition "status" in the entry name depicts if a member is a person or organization and should be treated as such. -->
+<!-- A so-called relationship entity is provided by the CDH to link these records. A nice graph is able to show the network. -->
+
+
+<!-- The beginning remains unchanged: -->
+
+<!-- ```{r, warning=FALSE, message=FALSE} -->
+<!-- library(XML) -->
+<!-- raw <- readLines("Ges0605.xml") -->
+<!-- xml <- xmlTreeParse(raw, useInternal = T) -->
+<!-- records <- xpathSApply(xml, "//entity") -->
+<!-- ``` -->
+
+<!-- see http://rpackages.ianhowson.com/cran/XML/man/asXMLTreeNode.html to make a real xml file -->
+<!-- http://stackoverflow.com/questions/35234863/how-convert-a-data-frame-into-a-xml-file-with-r -->
+
+<!-- ```{r, warning=FALSE, message=FALSE} -->
+<!-- # this one retrieves all attributes that are mentioned on the header level -->
+<!-- xpathSApply(records[[1]], "headerEntry/attribute::*") -->
+<!-- # this extracts the comment section and the reference source -->
+<!-- xpathSApply(records[[1]], "headerEntry/child::commEn") -->
+<!-- xpathSApply(records[[1]], "headerEntry/child::source") -->
+<!-- ``` -->
+
+<!-- ```{r, warning=FALSE, message=FALSE} -->
+<!-- records[[13]] -->
+<!-- # retrieves all name entries -->
+<!-- identities <- xpathSApply(records[[13]], "nameEntry") -->
+<!-- # retrieves all address entries -->
+<!-- addresses <- xpathSApply(records[[13]], "addressEntry") -->
+<!-- # what is still needed in the header is key, source and type -->
+<!-- # 1. extract the key (main_id) -->
+<!-- key <- as.character(xpathSApply(records[[13]], "attribute::mainId")) -->
+<!-- # 2. extract the source -->
+<!-- source <- as.character(xpathSApply(records[[13]], "headerEntry/attribute::sourceType")) -->
+<!-- # 3. extract the type ("E" says "organization", "P" says "person") -->
+<!-- type <- as.character(xpathSApply(records[[13]], "headerEntry/attribute::entityType")) -->
+<!-- type <- ifelse(type == "E", "organization", "person") -->
+
+<!-- library(XML) -->
+<!-- tree <- xmlTree() -->
+<!-- for (i in 1:length(identities)) { -->
+<!-- identities.df <- xmlToDataFrame(identities[i]) -->
+<!-- addresses.df <- xmlToDataFrame(addresses[1]) -->
+
+<!-- tree$addTag("record", close=FALSE, attrs=c(source=source, key=MHmakeRandomString(1), type=type)) -->
+<!-- # add person/organization entity -->
+<!-- if(type=="person"){ -->
+<!--   tree$addTag("person", close=FALSE) -->
+<!--   } -->
+<!-- if(type=="organization"){ -->
+<!--   tree$addTag("organization", close=FALSE) -->
+<!--   } -->
+<!--     for (j in names(identities.df)) { -->
+<!--         tree$addTag(j, identities.df[, j]) -->
+<!--     } -->
+<!-- tree$closeTag() -->
+<!-- # now add address to node -->
+<!--  tree$addTag("postal_address", close=FALSE) -->
+<!--     for (k in names(addresses.df)) { -->
+<!--         tree$addTag(k, addresses.df[, k]) -->
+<!--     } -->
+<!-- tree$closeTag() -->
+<!-- # add relation entity -->
+<!--  tree$addTag("relation", close=FALSE) -->
+<!--   tree$addTag("source", source) -->
+<!--   tree$addTag("key", key) -->
+<!--   tree$addTag("type", "contact") -->
+<!--  tree$closeTag() -->
+
+<!-- tree$closeTag() -->
+<!-- cat(as(tree, "character"), file=tf <- tempfile(fileext = ".xml"), sep="\n") -->
+
+<!-- } -->
+
+
+
+
+<!-- # function stolen from the internet -->
+<!-- MHmakeRandomString <- function(n=1, lenght=12) -->
+<!-- { -->
+<!--     randomString <- c(1:n)                  # initialize vector -->
+<!--     for (i in 1:n) -->
+<!--     { -->
+<!--         randomString[i] <- paste(sample(c(0:9, letters, LETTERS), -->
+<!--                                         lenght, replace=TRUE), -->
+<!--                                  collapse="") -->
+<!--     } -->
+<!--     return(randomString) -->
+<!-- } -->
+
+
+<!-- ``` -->
+
+<!-- xmltocdh <- list() -->
+
+<!-- for(i in 1:length(identities)){ -->
+<!-- tree <- xmlTree() -->
+
+<!-- identities.df <- xmlToDataFrame(identities[i]) -->
+<!-- addresses.df <- xmlToDataFrame(addresses[1]) -->
+
+<!-- tree$addTag("record", close=FALSE, attrs=c(source=source, key=MHmakeRandomString(1), type=type)) -->
+<!-- # add person/organization entity -->
+<!-- if(type=="person"){ -->
+<!--   tree$addTag("person", close=FALSE) -->
+<!--   } -->
+<!-- if(type=="organization"){ -->
+<!--   tree$addTag("organization", close=FALSE) -->
+<!--   } -->
+<!--     for (j in names(identities.df)) { -->
+<!--         tree$addTag(j, identities.df[, j]) -->
+<!--     } -->
+<!-- tree$closeTag() -->
+<!-- # now add address to node -->
+<!--  tree$addTag("postal_address", close=FALSE) -->
+<!--     for (k in names(addresses.df)) { -->
+<!--         tree$addTag(k, addresses.df[, k]) -->
+<!--     } -->
+<!-- tree$closeTag() -->
+<!--  tree$addTag("relation", close=FALSE) -->
+<!--   tree$addTag("source", source) -->
+<!--   tree$addTag("key", key) -->
+<!--   tree$addTag("type", "ispartof") -->
+<!--  tree$closeTag() -->
+<!-- tree$closeTag() -->
+<!-- xmltocdh <- append(saveXML(tree), xmltocdh) -->
+<!-- } -->
+
+
